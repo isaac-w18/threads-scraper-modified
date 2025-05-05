@@ -1,0 +1,277 @@
+import puppeteer from "puppeteer";
+import { writeToPath } from "@fast-csv/format";
+import * as dotenv from "dotenv";
+import * as fs from "fs";
+import * as path from "path";
+dotenv.config();
+
+type Thread = {
+  Username: string;
+  Content: string;
+  Likes: string;
+  Timestamp: string;
+  Url: string;
+  Keyword: string;
+};
+
+async function scrapeThreads() {
+  const keyword = process.env.KEYWORD || "javascript";
+  const maxThreads = parseInt(process.env.MAX_THREADS || "50", 10);
+  const headless = process.env.HEADLESS !== "false";
+
+  console.log(`🔍 Starting scraper for "${keyword}", up to ${maxThreads} posts`);
+
+  const debugDir = path.join(process.cwd(), "debug");
+  if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir);
+
+  // Launch browser
+  const browser = await puppeteer.launch({ 
+    headless, 
+    defaultViewport: null, 
+    args: ["--window-size=1280,800"] 
+  });
+  
+  const page = await browser.newPage();
+  
+  // Set a realistic user agent
+  await page.setUserAgent(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+    "Chrome/120.0.0.0 Safari/537.36"
+  );
+
+  const threadsMap = new Map<string, Thread>();
+  
+  try {
+    // Navigate to search page
+    console.log(`Navigating to search page for "${keyword}"...`);
+    await page.goto(
+      `https://www.threads.net/search?q=${encodeURIComponent(keyword)}`,
+      { waitUntil: "networkidle2", timeout: 60000 }
+    );
+    
+    // Take a screenshot for debugging
+    await page.screenshot({ path: path.join(debugDir, 'search-page.png') });
+    
+    // Wait for content to load
+    await page.evaluate(ms => new Promise(resolve => setTimeout(resolve, ms)), 5000);
+    
+    // Extract all JSON scripts from the page
+    console.log("Extracting JSON data from the page...");
+    
+    const extractAndProcessJsonScripts = async () => {
+      const scripts = await page.evaluate(() => {
+        const scriptElements = Array.from(document.querySelectorAll('script[type="application/json"]'));
+        return scriptElements.map((script, index) => {
+          try {
+            return {
+              index,
+              content: (script as HTMLScriptElement).textContent || ""
+            };
+          } catch (e) {
+            return { index, error: String(e) };
+          }
+        });
+      });
+      
+      console.log(`Found ${scripts.length} JSON scripts on the page`);
+      
+      // Save all scripts for debugging
+      for (let i = 0; i < scripts.length; i++) {
+        try {
+          if (scripts[i].content) {
+            const jsonData = JSON.parse(scripts[i].content);
+            fs.writeFileSync(
+              path.join(debugDir, `script-${i}.json`), 
+              JSON.stringify(jsonData, null, 2)
+            );
+            
+            // Extract threads from this JSON data
+            const extractedThreads = await page.evaluate((data, kw) => {
+              const threads: any[] = [];
+              const seen = new Set<string>();
+              
+              // Function to recursively search for thread data
+              const searchForThreads = (obj: any, path = '') => {
+                if (!obj || typeof obj !== 'object') return;
+                
+                // Check if this is a thread item
+                if (
+                  (obj.user?.username || obj.username) && 
+                  (obj.caption?.text || obj.text || obj.content) && 
+                  (obj.code || obj.id || obj.shortcode)
+                ) {
+                  const username = obj.user?.username || obj.username || '';
+                  const content = obj.caption?.text || obj.text || obj.content || '';
+                  let url = '';
+                  
+                  if (obj.permalink) {
+                    url = obj.permalink.startsWith("http")
+                      ? obj.permalink
+                      : `https://www.threads.net${obj.permalink}`;
+                  } else if (obj.code || obj.id || obj.shortcode) {
+                    url = `https://www.threads.net/t/${obj.code || obj.id || obj.shortcode}`;
+                  }
+                  
+                  if (!url || seen.has(url)) return;
+                  seen.add(url);
+                  
+                  const likes = String(
+                    obj.like_count || 
+                    obj.likes || 
+                    obj.edge_liked_by?.count || 
+                    obj.edge_media_preview_like?.count || 
+                    0
+                  );
+                  
+                  let timestamp = '';
+                  if (obj.taken_at) {
+                    timestamp = new Date(obj.taken_at * 1000).toISOString();
+                  } else if (obj.created_at) {
+                    timestamp = new Date(obj.created_at * 1000).toISOString();
+                  } else if (obj.timestamp) {
+                    const ts = typeof obj.timestamp === 'number' 
+                      ? obj.timestamp 
+                      : parseInt(obj.timestamp, 10);
+                    if (!isNaN(ts)) {
+                      timestamp = new Date(ts * 1000).toISOString();
+                    }
+                  }
+                  
+                  threads.push({
+                    Username: username,
+                    Content: content,
+                    Likes: likes,
+                    Timestamp: timestamp,
+                    Url: url,
+                    Keyword: kw
+                  });
+                }
+                
+                // Check for thread_items, items, or edges arrays
+                if (obj.thread_items && Array.isArray(obj.thread_items)) {
+                  for (const item of obj.thread_items) {
+                    searchForThreads(item, `${path}.thread_items`);
+                  }
+                }
+                
+                if (obj.items && Array.isArray(obj.items)) {
+                  for (const item of obj.items) {
+                    searchForThreads(item, `${path}.items`);
+                  }
+                }
+                
+                if (obj.edges && Array.isArray(obj.edges)) {
+                  for (const edge of obj.edges) {
+                    searchForThreads(edge.node || edge, `${path}.edges`);
+                  }
+                }
+                
+                // Special case for Threads.net data structure
+                if (obj.data?.xdt_api__v1__feed__timeline__connection) {
+                  searchForThreads(obj.data.xdt_api__v1__feed__timeline__connection, `${path}.xdt_api`);
+                }
+                
+                // Recursively search through nested objects
+                if (Array.isArray(obj)) {
+                  for (let i = 0; i < obj.length; i++) {
+                    searchForThreads(obj[i], `${path}[${i}]`);
+                  }
+                } else if (typeof obj === 'object') {
+                  for (const key in obj) {
+                    searchForThreads(obj[key], `${path}.${key}`);
+                  }
+                }
+              };
+              
+              // Start the search from the root
+              searchForThreads(data);
+              
+              return threads;
+            }, jsonData, keyword);
+            
+            // Only log when threads are found to reduce noise
+            if (extractedThreads.length > 0) {
+              console.log(`Found ${extractedThreads.length} threads in script ${i}`);
+            }
+            
+            // Add extracted threads to the map
+            for (const thread of extractedThreads) {
+              if (!threadsMap.has(thread.Url)) {
+                threadsMap.set(thread.Url, thread);
+                console.log(`Added thread: ${thread.Url}`);
+              }
+            }
+          }
+        } catch (error) {
+          console.error(`Error processing script ${i}:`, error);
+          if (scripts[i].content) {
+            fs.writeFileSync(
+              path.join(debugDir, `script-${i}-raw.txt`), 
+              scripts[i].content
+            );
+          }
+        }
+      }
+    };
+    
+    // Extract and process JSON scripts initially
+    await extractAndProcessJsonScripts();
+    
+    // Scroll and extract more if needed
+    let previousSize = threadsMap.size;
+    let emptyScrolls = 0;
+    
+    while (threadsMap.size < maxThreads && emptyScrolls < 10) { // Increased from 5 to 10
+      console.log(`Scrolling to load more threads... (${threadsMap.size}/${maxThreads})`);
+      
+      // Scroll multiple times before checking for new content
+      for (let i = 0; i < 3; i++) {
+        await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+        await page.evaluate(ms => new Promise(resolve => setTimeout(resolve, ms)), 2000);
+      }
+      
+      // Take a screenshot after scrolling
+      await page.screenshot({ path: path.join(debugDir, `after-scroll-${emptyScrolls}.png`) });
+      
+      // Extract and process JSON scripts again
+      const beforeCount = threadsMap.size;
+      await extractAndProcessJsonScripts();
+      
+      if (threadsMap.size === previousSize) {
+        emptyScrolls++;
+        console.log(`No new threads found after scrolling (${emptyScrolls}/10)`);
+      } else {
+        const newThreads = threadsMap.size - previousSize;
+        console.log(`Found ${newThreads} new threads after scrolling, total: ${threadsMap.size}`);
+        previousSize = threadsMap.size;
+        emptyScrolls = 0;
+      }
+      
+      // Add a longer wait between scroll batches
+      await page.evaluate(ms => new Promise(resolve => setTimeout(resolve, ms)), 3000);
+    }
+  } catch (error) {
+    console.error('Error during scraping:', error);
+  } finally {
+    await browser.close();
+  }
+  
+  console.log(`✅ Done: ${threadsMap.size} threads collected.`);
+
+  const rows = Array.from(threadsMap.values());
+  if (!rows.length) {
+    console.warn("⚠️ No threads to write.");
+    return;
+  }
+  
+  const fn = `threads_${keyword}_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+  writeToPath(fn, rows, { headers: true })
+    .on("finish", () => console.log(`📁 Saved: ${fn}`))
+    .on("error", e => console.error("CSV write error:", e));
+}
+
+scrapeThreads().catch(e => {
+  console.error("Fatal:", e);
+  process.exit(1);
+});
