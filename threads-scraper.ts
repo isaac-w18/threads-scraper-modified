@@ -3,23 +3,20 @@ import { writeToPath } from "@fast-csv/format";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
+import { ThreadsAnalyzer, Thread } from "./ThreadsAnalyzer";
 dotenv.config();
-
-type Thread = {
-  Username: string;
-  Content: string;
-  Likes: string;
-  Timestamp: string;
-  Url: string;
-  Keyword: string;
-};
 
 async function scrapeThreads() {
   const keyword = process.env.KEYWORD || "javascript";
   const maxThreads = parseInt(process.env.MAX_THREADS || "50", 10);
   const headless = process.env.HEADLESS !== "false";
+  const runAnalysis = process.env.RUN_ANALYSIS === "true";
+  const maxAnalysisThreads = parseInt(process.env.MAX_ANALYSIS_THREADS || "10", 10); // Limit analysis to avoid rate limits
 
   console.log(`🔍 Starting scraper for "${keyword}", up to ${maxThreads} posts`);
+  if (runAnalysis) {
+    console.log(`AI analysis will be performed on up to ${maxAnalysisThreads} threads`);
+  }
 
   const debugDir = path.join(process.cwd(), "debug");
   if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir);
@@ -53,8 +50,8 @@ async function scrapeThreads() {
     // Take a screenshot for debugging
     await page.screenshot({ path: path.join(debugDir, 'search-page.png') });
     
-    // Wait for content to load
-    await page.evaluate(ms => new Promise(resolve => setTimeout(resolve, ms)), 5000);
+    // Wait for content to load - reduced from 5000 to 2000
+    await page.evaluate(ms => new Promise(resolve => setTimeout(resolve, ms)), 2000);
     
     // Extract all JSON scripts from the page
     console.log("Extracting JSON data from the page...");
@@ -222,20 +219,19 @@ async function scrapeThreads() {
     let previousSize = threadsMap.size;
     let emptyScrolls = 0;
     
-    while (threadsMap.size < maxThreads && emptyScrolls < 10) { // Increased from 5 to 10
+    while (threadsMap.size < maxThreads && emptyScrolls < 10) {
       console.log(`Scrolling to load more threads... (${threadsMap.size}/${maxThreads})`);
       
-      // Scroll multiple times before checking for new content
+      // Scroll multiple times before checking for new content - reduced delay from 2000 to 1000
       for (let i = 0; i < 3; i++) {
         await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-        await page.evaluate(ms => new Promise(resolve => setTimeout(resolve, ms)), 2000);
+        await page.evaluate(ms => new Promise(resolve => setTimeout(resolve, ms)), 1000);
       }
       
       // Take a screenshot after scrolling
       await page.screenshot({ path: path.join(debugDir, `after-scroll-${emptyScrolls}.png`) });
       
       // Extract and process JSON scripts again
-      const beforeCount = threadsMap.size;
       await extractAndProcessJsonScripts();
       
       if (threadsMap.size === previousSize) {
@@ -248,8 +244,8 @@ async function scrapeThreads() {
         emptyScrolls = 0;
       }
       
-      // Add a longer wait between scroll batches
-      await page.evaluate(ms => new Promise(resolve => setTimeout(resolve, ms)), 3000);
+      // Add a longer wait between scroll batches - reduced from 3000 to 1500
+      await page.evaluate(ms => new Promise(resolve => setTimeout(resolve, ms)), 1500);
     }
   } catch (error) {
     console.error('Error during scraping:', error);
@@ -259,10 +255,35 @@ async function scrapeThreads() {
   
   console.log(`✅ Done: ${threadsMap.size} threads collected.`);
 
-  const rows = Array.from(threadsMap.values());
+  let rows = Array.from(threadsMap.values());
   if (!rows.length) {
     console.warn("⚠️ No threads to write.");
     return;
+  }
+  
+  // Run AI analysis if enabled
+  if (runAnalysis) {
+    try {
+      // Limit the number of threads to analyze to avoid rate limits
+      const threadsToAnalyze = rows.slice(0, maxAnalysisThreads);
+      console.log(`Running AI analysis on ${threadsToAnalyze.length} threads...`);
+      
+      const analyzer = new ThreadsAnalyzer();
+      const analyzedThreads = await analyzer.analyzeThreads(threadsToAnalyze);
+      
+      // Merge analyzed threads back with the original set
+      if (threadsToAnalyze.length < rows.length) {
+        const analyzedUrls = new Set(analyzedThreads.map(t => t.Url));
+        const remainingThreads = rows.filter(t => !analyzedUrls.has(t.Url));
+        rows = [...analyzedThreads, ...remainingThreads];
+      } else {
+        rows = analyzedThreads;
+      }
+      
+      console.log("AI analysis completed successfully");
+    } catch (error) {
+      console.error("Error during AI analysis:", error);
+    }
   }
   
   const fn = `threads_${keyword}_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
