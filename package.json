@@ -20,6 +20,7 @@
     "dotenv": "^16.5.0",
     "fast-csv": "^5.0.2",
     "jmespath": "^0.16.0",
+    "node-fetch": "^3.3.2",
     "puppeteer": "^24.8.0"
   }
 }

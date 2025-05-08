@@ -108,7 +108,8 @@ async function scrapeThreads() {
     // initial wait + extract
     await sleep(3000);
     await extractOnce();
-    console.log(`→ Collected ${threadsMap.size} so far`);
+    // console.log(`→ Collected ${threadsMap.size} so far`);
+
     // scroll + extract loop
     let prev = threadsMap.size, empty = 0;
     while (threadsMap.size < maxThreads && empty < 10) {
@@ -121,7 +122,7 @@ async function scrapeThreads() {
             prev = threadsMap.size;
             empty = 0;
         }
-        console.log(`→ Collected ${threadsMap.size} so far (empty streak=${empty})`);
+        // console.log(`→ Collected ${threadsMap.size} so far (empty streak=${empty})`);
     }
     await browser.close();
     console.log(`✅ Done: ${threadsMap.size} threads collected.`);

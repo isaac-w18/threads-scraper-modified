@@ -23,14 +23,6 @@ export class ThreadsAnalyzer {
   private maxRetries = 5;
   private sentimentModelEndpoint = "tabularisai/multilingual-sentiment-analysis"; // Good for sentiment analysis
 
-  private sentimentMap: { [key: number]: string } = {
-    0: "Very Negative", 
-    1: "Negative", 
-    2: "Neutral", 
-    3: "Positive", 
-    4: "Very Positive"
-  };
-
   constructor() {
     this.huggingFaceToken = process.env.HUGGINGFACE_API_KEY || "";
     if (!this.huggingFaceToken) {
@@ -84,7 +76,7 @@ export class ThreadsAnalyzer {
       return await this.analyzeSentiment(content);
     } catch (error: any) {
       if (retryCount < this.maxRetries && (error.status === 429 || error.status === 503)) {
-        const waitTime = Math.pow(2, retryCount) * 1000; // Exponential backoff
+        const waitTime = Math.pow(2, retryCount) * 1000 + 4000; // Exponential backoff
         console.log(`Rate limit hit, waiting for ${waitTime/1000} seconds before retry ${retryCount + 1}/${this.maxRetries}...`);
         await setTimeout(waitTime);
         return this.analyzeSentimentWithRetry(content, retryCount + 1);
@@ -110,9 +102,15 @@ export class ThreadsAnalyzer {
     // Truncate content if it's too long (Hugging Face models typically have token limits)
     const truncatedContent = content.length > 500 ? content.substring(0, 500) + "..." : content;
 
+    const filteredContent = this.filterURL(truncatedContent); 
+    console.log(`Filtered content: ${filteredContent}`);
+
     // Add context to help the model understand we're looking for sentiment towards Oen Tech
-    const contextualContent = `This is likely a comment about Oen Tech (@oen.tw): "${truncatedContent}"`;
-    
+    //  change based on ENV
+    // const contextualContent = `This is likely a comment about Oen Tech (@oen.tw): "${truncatedContent}"`;
+    // const contextualContent = `This is likely a comment about (@oen.tw): "${truncatedContent}"`;
+    const contextualContent = `This is likely a comment about Oen Tech (@oen.tw): "${filteredContent}"`;
+
     // Verify token is set
     if (!this.huggingFaceToken) {
       throw new Error("No Hugging Face API token provided");
@@ -155,26 +153,22 @@ export class ThreadsAnalyzer {
       console.log("Sentiment: " + sentiment);
       console.log("Max Score: " + max_score);
 
-      /* Structure of data:
-      [
-        [
-          { label: 'Neutral', score: 0.2847346067428589 },
-          { label: 'Positive', score: 0.21517086029052734 },
-          { label: 'Very Positive', score: 0.18649983406066895 },
-          { label: 'Negative', score: 0.16260169446468353 },
-          { label: 'Very Negative', score: 0.15099301934242249 }
-        ]
-      ]
-      */
-
       return sentiment;
-      
     }
     
     // Default to Unknown if we can't determine
-    return "Unkown";
+    return "Unknown";
+  }
+
+  private filterURL(content: string): string {
+    // Define a regular expression to match URLs
+    const oenURL = /(https?:\/\/[^\s]*oen.tw\/[^\s]*)/g;
+    const unrelatedURL = /(https?:\/\/[^\s]*)/g;
+
+    // Replace URLs with a placeholder
+    const filteredContentOen = content.replace(oenURL, "(oen.tw)");
+    const filteredContentFinal = filteredContentOen.replace(unrelatedURL, "[URL]");
+
+    return filteredContentFinal;
   }
 }
-
-
-
