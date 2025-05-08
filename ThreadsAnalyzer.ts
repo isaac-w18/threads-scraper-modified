@@ -11,45 +11,38 @@ export type Thread = {
   Timestamp: string;
   Url: string;
   Keyword: string;
-  Emotion?: string;
-  Importance?: string;
+  Sentiment?: string;  // Number of Classes: 5 (Very Negative, Negative, Neutral, Positive, Very Positive)
 };
 
-// Define types for Hugging Face API responses
-type EmotionResponse = Array<{label: string, score: number}> | Array<Array<{label: string, score: number}>>;
-type ImportanceResponse = {
-  labels: string[];
-  scores: number[];
-  sequence: string;
-};
+// Define type for Hugging Face API sentiment response
+type SentimentResponse = Array<Array<{label: string, score: number}>>;
 
 export class ThreadsAnalyzer {
   private huggingFaceToken: string;
   private rateLimitDelay = 2000; // 2 seconds between API calls
-  private maxRetries = 3;
-  private emotionModelEndpoint = "SamLowe/roberta-base-go_emotions"; // Good emotion model
-  private classificationModelEndpoint = "facebook/bart-large-mnli"; // Good for text classification
-  private useLocalFallback = true; // Use local analysis if API fails
+  private maxRetries = 5;
+  private sentimentModelEndpoint = "tabularisai/multilingual-sentiment-analysis"; // Good for sentiment analysis
+
+  private sentimentMap: { [key: number]: string } = {
+    0: "Very Negative", 
+    1: "Negative", 
+    2: "Neutral", 
+    3: "Positive", 
+    4: "Very Positive"
+  };
 
   constructor() {
     this.huggingFaceToken = process.env.HUGGINGFACE_API_KEY || "";
     if (!this.huggingFaceToken) {
-      console.warn("⚠️ No HUGGINGFACE_API_KEY found in .env file. Using local fallback analysis.");
-      this.useLocalFallback = true;
+      throw new Error("HUGGINGFACE_API_KEY is required in .env file");
     }
   }
 
   /**
-   * Analyzes a batch of threads for emotion and importance
+   * Analyzes a batch of threads for sentiment
    */
   async analyzeThreads(threads: Thread[]): Promise<Thread[]> {
-    console.log(`🧠 Starting AI analysis of ${threads.length} threads...`);
-    
-    if (this.useLocalFallback) {
-      console.log("Using local analysis (no API calls) due to missing or invalid API key");
-    } else {
-      console.log("Using Hugging Face API for analysis");
-    }
+    console.log(`🧠 Starting sentiment analysis of ${threads.length} threads...`);
     
     const analyzedThreads: Thread[] = [];
     
@@ -58,65 +51,48 @@ export class ThreadsAnalyzer {
       console.log(`Analyzing thread ${i+1}/${threads.length}: ${thread.Url.substring(0, 50)}...`);
       
       try {
-        const analysis = await this.analyzeContentWithRetry(thread.Content);
+        const sentiment = await this.analyzeSentimentWithRetry(thread.Content);
         analyzedThreads.push({
           ...thread,
-          Emotion: analysis.emotion,
-          Importance: analysis.importance
+          Sentiment: sentiment
         });
         
-        // Add delay between API calls to respect rate limits (only if using API)
-        if (!this.useLocalFallback && i < threads.length - 1) {
+        // Add delay between API calls to respect rate limits
+        if (i < threads.length - 1) {
           console.log(`Waiting ${this.rateLimitDelay/1000} seconds before next analysis...`);
           await setTimeout(this.rateLimitDelay);
         }
       } catch (error) {
         console.error(`Error analyzing thread ${thread.Url}:`, error);
-        
-        // Use local fallback for this thread
-        const fallbackAnalysis = this.localAnalyzeContent(thread.Content);
+        // Skip this thread if analysis fails
         analyzedThreads.push({
           ...thread,
-          Emotion: fallbackAnalysis.emotion,
-          Importance: fallbackAnalysis.importance
+          Sentiment: "Unknown" // Mark failed analyses as Unknown
         });
-        
-        // If we're still trying to use the API but getting errors, switch to local fallback
-        if (!this.useLocalFallback) {
-          console.log("Switching to local fallback analysis for all remaining threads");
-          this.useLocalFallback = true;
-        }
       }
     }
     
-    console.log(`✅ AI analysis complete for ${analyzedThreads.length} threads`);
+    console.log(`✅ Sentiment analysis complete for ${analyzedThreads.length} threads`);
     return analyzedThreads;
   }
 
   /**
-   * Analyzes content with retry logic
+   * Analyzes sentiment with retry logic
    */
-  private async analyzeContentWithRetry(content: string, retryCount = 0): Promise<{ emotion: string; importance: string }> {
-    // If we're using local fallback, don't even try the API
-    if (this.useLocalFallback) {
-      return this.localAnalyzeContent(content);
-    }
-    
+  private async analyzeSentimentWithRetry(content: string, retryCount = 0): Promise<string> {
     try {
-      return await this.analyzeContent(content);
+      return await this.analyzeSentiment(content);
     } catch (error: any) {
       if (retryCount < this.maxRetries && (error.status === 429 || error.status === 503)) {
-        const waitTime = (retryCount + 1) * 5000; // Exponential backoff
+        const waitTime = Math.pow(2, retryCount) * 1000; // Exponential backoff
         console.log(`Rate limit hit, waiting for ${waitTime/1000} seconds before retry ${retryCount + 1}/${this.maxRetries}...`);
         await setTimeout(waitTime);
-        return this.analyzeContentWithRetry(content, retryCount + 1);
+        return this.analyzeSentimentWithRetry(content, retryCount + 1);
       }
       
       // If we get a 403 error, it's likely an API key issue
       if (error.message && error.message.includes("403")) {
-        console.error("API key error (403 Forbidden). Check your HUGGINGFACE_API_KEY in .env file.");
-        this.useLocalFallback = true;
-        return this.localAnalyzeContent(content);
+        const error = new Error("API key error (403 Forbidden). Check your HUGGINGFACE_API_KEY in .env file.");
       }
       
       throw error;
@@ -124,231 +100,81 @@ export class ThreadsAnalyzer {
   }
 
   /**
-   * Local fallback analysis without API calls
+   * Analyzes sentiment of content using Hugging Face model
    */
-  private localAnalyzeContent(content: string): { emotion: string; importance: string } {
+  private async analyzeSentiment(content: string): Promise<string> {
     if (!content || content.trim().length === 0) {
-      return { emotion: "Neutral", importance: "Low" };
-    }
-    
-    // Simple keyword-based emotion detection
-    const text = content.toLowerCase();
-    let emotion = "Neutral";
-    
-    // Happy keywords
-    if (/great|happy|awesome|love|excellent|amazing|joy|glad|excited|wonderful/i.test(text)) {
-      emotion = "Happy";
-    } 
-    // Sad keywords
-    else if (/sad|disappointed|sorry|unfortunate|regret|miss|loss|bad|terrible|fail/i.test(text)) {
-      emotion = "Sad";
-    }
-    // Angry keywords
-    else if (/angry|mad|furious|annoyed|irritated|upset|hate|terrible|awful|worst/i.test(text)) {
-      emotion = "Angry";
-    }
-    // Surprised keywords
-    else if (/wow|omg|surprised|unexpected|shocking|amazed|astonished|unbelievable/i.test(text)) {
-      emotion = "Surprised";
-    }
-    
-    // Simple importance detection based on content length and keywords
-    let importance = "Medium";
-    
-    // Longer content tends to be more important
-    if (content.length > 300) {
-      importance = "High";
-    } else if (content.length < 100) {
-      importance = "Low";
-    }
-    
-    // Important keywords override
-    if (/important|urgent|attention|must|critical|essential|significant|key|major/i.test(text)) {
-      importance = "High";
-    }
-    
-    return { emotion, importance };
-  }
-
-  /**
-   * Analyzes a single thread's content using Hugging Face models
-   */
-  private async analyzeContent(content: string): Promise<{ emotion: string; importance: string }> {
-    if (!content || content.trim().length === 0) {
-      return { emotion: "Neutral", importance: "Low" };
+      return "Neutral";
     }
 
     // Truncate content if it's too long (Hugging Face models typically have token limits)
     const truncatedContent = content.length > 500 ? content.substring(0, 500) + "..." : content;
 
-    // Get emotion using emotion classification model
-    const emotion = await this.getEmotion(truncatedContent);
+    // Add context to help the model understand we're looking for sentiment towards Oen Tech
+    const contextualContent = `This is likely a comment about Oen Tech (@oen.tw): "${truncatedContent}"`;
     
-    // Get importance using text classification model
-    const importance = await this.getImportance(truncatedContent);
-    
-    return {
-      emotion,
-      importance
-    };
-  }
-
-  /**
-   * Get emotion from content using Hugging Face emotion model
-   */
-  private async getEmotion(content: string): Promise<string> {
-    try {
-      // Verify token is set
-      if (!this.huggingFaceToken) {
-        throw new Error("No Hugging Face API token provided");
-      }
-      
-      const response = await fetch(
-        `https://api-inference.huggingface.co/models/${this.emotionModelEndpoint}`,
-        {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${this.huggingFaceToken}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ inputs: content })
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(`Hugging Face API error: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json() as EmotionResponse;
-      
-      // Handle different response formats
-      if (Array.isArray(data) && data.length > 0) {
-        // Format 1: Array of label/score objects
-        if (Array.isArray(data[0])) {
-          // Sort by score and get the highest one
-          const sortedEmotions = [...data[0]].sort((a, b) => b.score - a.score);
-          return this.mapEmotionLabel(sortedEmotions[0].label);
-        } 
-        // Format 2: Array of objects with label/score
-        else if ('label' in data[0]) {
-          return this.mapEmotionLabel(data[0].label);
-        }
-      }
-      
-      // Default to Neutral if we can't parse the response
-      return "Neutral";
-    } catch (error) {
-      console.error("Error getting emotion:", error);
-      throw error; // Re-throw to trigger fallback
+    // Verify token is set
+    if (!this.huggingFaceToken) {
+      throw new Error("No Hugging Face API token provided");
     }
-  }
-
-  /**
-   * Map raw emotion labels to standardized ones
-   */
-  private mapEmotionLabel(label: string): string {
-    // Map specific emotion labels to more general categories
-    const emotionMap: Record<string, string> = {
-      // Common emotion labels from Hugging Face models
-      "admiration": "Happy",
-      "amusement": "Happy",
-      "anger": "Angry",
-      "annoyance": "Angry",
-      "approval": "Happy",
-      "caring": "Happy",
-      "confusion": "Confused",
-      "curiosity": "Curious",
-      "desire": "Excited",
-      "disappointment": "Sad",
-      "disapproval": "Angry",
-      "disgust": "Angry",
-      "embarrassment": "Sad",
-      "excitement": "Excited",
-      "fear": "Fearful",
-      "gratitude": "Happy",
-      "grief": "Sad",
-      "joy": "Happy",
-      "love": "Happy",
-      "nervousness": "Anxious",
-      "optimism": "Happy",
-      "pride": "Happy",
-      "realization": "Surprised",
-      "relief": "Happy",
-      "remorse": "Sad",
-      "sadness": "Sad",
-      "surprise": "Surprised",
-      // MNLI model specific labels
-      "LABEL_0": "Neutral",
-      "LABEL_1": "Happy",
-      "LABEL_2": "Sad",
-      "entailment": "Happy",
-      "contradiction": "Angry",
-      "neutral": "Neutral"
-    };
-
-    // Convert to lowercase for case-insensitive matching
-    const normalizedLabel = label.toLowerCase();
     
-    // Return mapped emotion or the original if not found
-    return emotionMap[normalizedLabel] || 
-           (normalizedLabel.includes("positive") ? "Happy" : 
-           (normalizedLabel.includes("negative") ? "Sad" : "Neutral"));
-  }
-
-  /**
-   * Get importance from content using Hugging Face classification model
-   */
-  private async getImportance(content: string): Promise<string> {
-    try {
-      // Verify token is set
-      if (!this.huggingFaceToken) {
-        throw new Error("No Hugging Face API token provided");
+    const response = await fetch(
+      `https://api-inference.huggingface.co/models/${this.sentimentModelEndpoint}`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${this.huggingFaceToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ inputs: contextualContent })
       }
-      
-      // For importance, we'll use a zero-shot classification approach
-      const response = await fetch(
-        `https://api-inference.huggingface.co/models/${this.classificationModelEndpoint}`,
-        {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${this.huggingFaceToken}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            inputs: content,
-            parameters: {
-              candidate_labels: ["important information", "somewhat important", "not important"]
-            }
-          })
-        }
-      );
+    );
 
-      if (!response.ok) {
-        throw new Error(`Hugging Face API error: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json() as ImportanceResponse;
-      
-      // Parse the response to get the most likely importance level
-      if (data && Array.isArray(data.labels) && Array.isArray(data.scores)) {
-        const highestScoreIndex = data.scores.indexOf(Math.max(...data.scores));
-        const label = data.labels[highestScoreIndex];
-        
-        // Map the label to High/Medium/Low
-        if (label.includes("important information")) {
-          return "High";
-        } else if (label.includes("somewhat important")) {
-          return "Medium";
-        } else {
-          return "Low";
-        }
-      }
-      
-      // Default to Medium if we can't parse the response
-      return "Medium";
-    } catch (error) {
-      console.error("Error getting importance:", error);
-      throw error; // Re-throw to trigger fallback
+    if (!response.ok) {
+      const error = new Error(`Hugging Face API error: ${response.status} ${response.statusText}`);
+      (error as any).status = response.status;
+      throw error;
     }
+
+    const data = await response.json() as SentimentResponse;
+    const data_subarray = data[0];
+    
+    // Map sentiment labels to sentiment categories
+    if (Array.isArray(data) && data_subarray.length > 0) {
+      console.log(data);
+      let max_score = data_subarray[0].score;
+      let sentiment = data_subarray[0].label;
+      for(let i = 1; i < data.length; i++) {
+        if (data_subarray[i].score > max_score) {
+          max_score = data_subarray[i].score;
+          sentiment = data_subarray[i].label;
+        }
+      }
+
+      // this is returning undefined for some reason
+      console.log("Sentiment: " + sentiment);
+      console.log("Max Score: " + max_score);
+
+      /* Structure of data:
+      [
+        [
+          { label: 'Neutral', score: 0.2847346067428589 },
+          { label: 'Positive', score: 0.21517086029052734 },
+          { label: 'Very Positive', score: 0.18649983406066895 },
+          { label: 'Negative', score: 0.16260169446468353 },
+          { label: 'Very Negative', score: 0.15099301934242249 }
+        ]
+      ]
+      */
+
+      return sentiment;
+      
+    }
+    
+    // Default to Unknown if we can't determine
+    return "Unkown";
   }
 }
+
+
+
