@@ -3,10 +3,10 @@ import { writeToPath } from "@fast-csv/format";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
-import { ThreadsAnalyzer, Thread } from "./ThreadsAnalyzer";
+import { ThreadsAnalyzer, Thread } from "./ThreadsAnalyzer.js";
 dotenv.config();
 
-async function scrapeThreads() {
+export async function scrapeThreads() {
   const keyword = process.env.KEYWORD || "javascript";
   const maxThreads = parseInt(process.env.MAX_THREADS || "50", 10);
   const headless = process.env.HEADLESS !== "false";
@@ -285,14 +285,19 @@ async function scrapeThreads() {
       console.error("Error during AI analysis:", error);
     }
   }
-  
+
+  // Write CSV
   const fn = `threads_${keyword}_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
-  writeToPath(fn, rows, { headers: true })
+  const filePath = path.join('Results', fn);
+
+  writeToPath(filePath, rows, { headers: true })
     .on("finish", () => console.log(`📁 Saved: ${fn}`))
     .on("error", e => console.error("CSV write error:", e));
 }
 
-scrapeThreads().catch(e => {
-  console.error("Fatal:", e);
-  process.exit(1);
-});
+export default scrapeThreads;
+
+// scrapeThreads().catch(e => {
+//   console.error("Fatal:", e);
+//   process.exit(1);
+// });
