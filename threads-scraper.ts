@@ -1,9 +1,10 @@
-import puppeteer from "puppeteer";
+import puppeteer from "puppeteer-core";
 import { writeToPath } from "@fast-csv/format";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
 import { ThreadsAnalyzer, Thread } from "./ThreadsAnalyzer.js";
+import chromium from "@sparticuz/chromium";
 dotenv.config();
 
 export async function scrapeThreads() {
@@ -21,14 +22,64 @@ export async function scrapeThreads() {
   const debugDir = path.join(process.cwd(), "debug");
   if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir);
 
+  let browser;
+  let page;
+
+  try {
+    console.log("Attempting to launch browser with Chromium from @sparticuz/chromium");
+    console.log(`Executable path: ${await chromium.executablePath()}`);
+    console.log(`Chrome args: ${JSON.stringify(chromium.args)}`);
   // Launch browser
-  const browser = await puppeteer.launch({ 
-    headless, 
-    defaultViewport: null, 
-    args: ["--window-size=1280,800"] 
+    const executablePath = await chromium.executablePath(process.env.AWS_EXECUTION_ENV? '/tmp/chromium': undefined);
+    console.log("Chromium Executable Path: ", executablePath);
+    browser = await puppeteer.launch({ 
+      headless: headless,
+      defaultViewport: {
+        width: 1280,
+        height: 800
+      }, 
+      args: [
+        ...chromium.args,
+        "--disable-gpu",
+        "--single-process",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--no-zygote",
+        "--disable-extensions"
+      ],
+      executablePath: executablePath,
+      ignoreHTTPSErrors: true,
+      timeout: 30000 // Increase timeout to 30 seconds
+    });
+
+  } catch(error) {
+    console.error("Failed to launch browser:", error);
+    throw error;
+  }
+
+  page = await browser.newPage();
+  page.on("console", msg => {
+    console.log("🖥️ BROWSER LOG:", msg.text());
   });
-  
-  const page = await browser.newPage();
+
+  page.on("error", err => {
+    console.error("🔥 PAGE ERROR:", err);
+  });
+
+  page.on("pageerror", err => {
+    console.error("⚠️ UNCAUGHT ERROR:", err);
+  });
+
+  page.on("requestfailed", req => {
+    console.warn("❌ REQUEST FAILED:", req.url(), req.failure());
+  });
+
+  page.on("response", res => {
+    if (!res.ok()) {
+      console.warn(`⚠️ NON-OK RESPONSE: ${res.status()} ${res.url()}`);
+    }
+  });
   
   // Set a realistic user agent
   await page.setUserAgent(
@@ -36,16 +87,68 @@ export async function scrapeThreads() {
     "AppleWebKit/537.36 (KHTML, like Gecko) " +
     "Chrome/120.0.0.0 Safari/537.36"
   );
+  await page.setExtraHTTPHeaders({
+    "accept-language": "en-US,en;q=0.9",
+  });
+
+  // Add this before navigation to check network connectivity
+  try {
+    const networkInfo = await page.evaluate(() => {
+      return {
+        userAgent: navigator.userAgent,
+        platform: navigator.platform,
+        language: navigator.language,
+        cookiesEnabled: navigator.cookieEnabled,
+        online: navigator.onLine
+      };
+    });
+    console.log("Browser network info:", networkInfo);
+  } catch (err) {
+    console.error("Failed to get network info:", err);
+  }
+
+  // page.on("error", err => console.error("❗ Page crashed:", err));
+  // page.on("pageerror", err => console.error("❗ Runtime error:", err));
+  // browser.on("disconnected", () => console.error("❗ Browser disconnected"));
+  await page.screenshot({ path: path.join(debugDir, 'first-test.png') });
+  try {
+          await page.goto(`https://example.com`, {
+            timeout: 60000,
+            waitUntil: ['load', 'networkidle0', 'domcontentloaded']
+          });
+      }
+      catch (err) {
+          console.error("Failed Example URL:", err);
+      }
+      await page.screenshot({ path: path.join(debugDir, 'first-test.png') });
+
+  try {
+      await page.goto(`https://www.lavuelta.es/en/rankings/stage-4`, {
+          waitUntil: "domcontentloaded",
+          timeout: 60000
+      });
+  }
+  catch (err) {
+      console.error("Failed to load Lavuelta URL:", err);
+  }
+  await page.screenshot({ path: path.join(debugDir, 'first-test.png') });
+
 
   const threadsMap = new Map<string, Thread>();
   
   try {
     // Navigate to search page
     console.log(`Navigating to search page for "${keyword}"...`);
-    await page.goto(
-      `https://www.threads.net/search?q=${encodeURIComponent(keyword)}`,
-      { waitUntil: "networkidle2", timeout: 60000 }
-    );
+    await page.setDefaultNavigationTimeout(90000); // 90 seconds
+    // Use a less strict wait condition
+    try {
+        await page.goto(`https://www.threads.net/search?q=${encodeURIComponent(keyword)}`, {
+            waitUntil: "domcontentloaded",
+            timeout: 60000
+        });
+    } catch (err) {
+        console.error("Failed to load Threads URL:", err);
+    }
     
     // Take a screenshot for debugging
     await page.screenshot({ path: path.join(debugDir, 'search-page.png') });
@@ -294,7 +397,6 @@ export async function scrapeThreads() {
     .on("finish", () => console.log(`📁 Saved: ${fn}`))
     .on("error", e => console.error("CSV write error:", e));
 }
-
 export default scrapeThreads;
 
 // scrapeThreads().catch(e => {
